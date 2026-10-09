@@ -1,7 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '**'
+      - '!**.md'
+      - '!.github/**'
+      - '.github/scripts/**'
+      - '.github/workflows/build_push.yml'
+  workflow_dispatch:
+
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI_CHUNK_SIZE: 15
+  IS_PR_CHECK: false
+
 jobs:
+  prepare:
+    permissions:
+      contents: write
+    name: Prepare job
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      latestCommitMessage: ${{ steps.set-env.outputs.LATEST_COMMIT_MESSAGE }}
+      matrix: ${{ steps.generate-matrices.outputs.matrix }}
+      delete: ${{ steps.generate-matrices.outputs.delete }}
+      skipBump: ${{ steps.set-env.outputs.SKIP_BUMP }}
+    steps:
+      - name: Checkout ${{ github.ref_name }} branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Set env
+        id: set-env
+        env:
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          LATEST_COMMIT_MESSAGE=$(git log -1 --pretty=%B "$HEAD_SHA")
+          echo "LATEST_COMMIT_MESSAGE<<{delimiter}
+          $LATEST_COMMIT_MESSAGE
+
+          Built on commit: $HEAD_SHA
+          {delimiter}" >> $GITHUB_OUTPUT
+
+          skip_bump=false
+          skip_build=false
+          case "$LATEST_COMMIT_MESSAGE" in
+            "[skip yuzono ci]"*)
+              skip_bump=true
+              skip_build=true
+              ;;
+            "[skip bumping version]"*)
+              skip_bump=true
+              ;;
+          esac
+
+          echo "SKIP_BUMP=$skip_bump" >> $GITHUB_OUTPUT
+          echo "SKIP_BUILD=$skip_build" >> $GITHUB_OUTPUT
+
+      - name: Find lib changes
+        id: modified-libs
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96
+        with:
+          files: lib/
+          files_ignore: lib/**.md
+          files_separator: " "
+          safe_output: false
+
+      - name: Get last successful CI commit
+        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1
+        with:
+          main-branch-name: ${{ github.ref_name }}
+          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
+      - id: generate-matrices
+        name: Create output matrices
+        env:
+          SKIP_BUILD: ${{ steps.set-env.outputs.SKIP_BUILD }}
+        run: |
+          if [ "$SKIP_BUILD" = "true" ]; then
+            echo "Skipping build: emitting empty matrices."
+            echo 'matrix={"chunk":[]}' >> $GITHUB_OUTPUT
+            echo 'delete=[]' >> $GITHUB_OUTPUT
+          else
+            python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
+          fi
+
+  build:
+    name: Build extensions (${{ matrix.chunk.number }})
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout ${{ github.ref_name }} branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6
+        with:
+          java-version: 25
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6
+        with:
+          cache-read-only: ${{ matrix.chunk.number > 1 }}
+
+      - name: Prepare signing key
+        run: |
+          echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
+          chmod 600 signingkey.jks
+
+      - name: Build extensions (${{ matrix.chunk.number }})
+        env:
+          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          MEGACLOUD_API: ${{ secrets.MEGACLOUD_API }}
+          KISSKH_API: ${{ secrets.KISSKH_API }}
+          KISSKH_SUB_API: ${{ secrets.KISSKH_SUB_API }}
+          KAISVA: ${{ secrets.KAISVA }}
+          TMDB_API: ${{ secrets.TMDB_API }}
+          WYZIE_API: ${{ secrets.WYZIE_API }}
+        run: |
+          ./gradlew $MODULES
+
+      - name: Upload APKs (${{ matrix.chunk.number }})
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: "individual-apks-${{ matrix.chunk.number }}"
+          path: "**/*.apk"
+          retention-days: 1
+
+      - name: Clean up CI files
+        run: rm signingkey.jks
+
   publish:
     name: Publish extension repo
     needs: [prepare, build]
@@ -49,7 +199,6 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ github.repository }}
-          token: ${{ secrets.GITHUB_TOKEN }}
           path: repo
           fetch-depth: 0
           persist-credentials: true
