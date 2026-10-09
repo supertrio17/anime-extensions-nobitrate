@@ -154,15 +154,26 @@ class AniDB :
         return sortedByDescending { it.internalData == langPref }
     }
 
-    override suspend fun getVideoList(hoster: Hoster): List<Video> {
+        override suspend fun getVideoList(hoster: Hoster): List<Video> {
         val link = client.get(hoster.hosterUrl, playHeaders).parseAs<IframeDto>().link
 
-        return playlistUtils.extractFromHls(
+        // Dobavljamo originalnu listu videa od PlaylistUtils-a
+        val videos = playlistUtils.extractFromHls(
             playlistUrl = link,
             masterHeaders = headers,
             videoHeaders = headers,
         )
+
+        // Regex koji pronalazi i briše " - 1.13 Mbps" ili " - 662 kbps"
+        val bitrateRegex = Regex(" - \\d+(\\.\\d+)?\\s*(Mbps|kbps)")
+
+        // Pravimo i vraćamo novu listu sa "očišćenim" stringom za kvalitet
+        return videos.map { video ->
+            val cleanQuality = video.quality.replace(bitrateRegex, "").trim()
+            Video(video.url, cleanQuality, video.videoUrl, video.headers)
+        }
     }
+
 
     override fun List<Video>.sortVideos(): List<Video> {
         val qualityPref = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
